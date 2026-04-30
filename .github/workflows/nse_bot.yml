@@ -31,6 +31,14 @@ jobs:
           restore-keys: |
             seen-ids-
 
+      - name: Debug - check secret length
+        env:
+          GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
+        run: |
+          echo "Secret length: ${#GOOGLE_CREDS_JSON}"
+          echo "First 10 chars: ${GOOGLE_CREDS_JSON:0:10}"
+          echo "Last 10 chars: ${GOOGLE_CREDS_JSON: -10}"
+
       - name: Write Google credentials to file
         env:
           GOOGLE_CREDS_JSON: ${{ secrets.GOOGLE_CREDS_JSON }}
