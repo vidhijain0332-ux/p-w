@@ -3,13 +3,11 @@ import json
 import time
 import logging
 import requests
+import httpx
 from datetime import datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import Bot
-import asyncio
 
-# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -17,12 +15,10 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
 SEEN_IDS_FILE = "seen_ids.json"
 NSE_API_URL   = "https://www.nseindia.com/api/corp-announcements"
-SCREENER_URL  = "https://www.screener.in/api/company/{symbol}/announcements/"
 
-HEADERS = {
+NSE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -33,170 +29,46 @@ HEADERS = {
     "Referer": "https://www.nseindia.com/",
 }
 
-# Keywords to filter (case-insensitive)
 KEYWORDS = ["preferential", "warrants", "allotment of securities"]
 
-# Google Sheets column order (matches your sheet headers exactly)
 SHEET_COLUMNS = [
-    "Logged at",
-    "Company Name",
-    "Symbol",
-    "Category",
-    "Title",
-    "Full Subject/Topic",
-    "NSE Dates",
-    "First Disclosure",
-    "NSE Link",
-    "Screener Link",
+    "Logged at", "Company Name", "Symbol", "Category", "Title",
+    "Full Subject/Topic", "NSE Dates", "First Disclosure", "NSE Link", "Screener Link",
 ]
 
-# ── Secrets from environment ──────────────────────────────────────────────────
-TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]   # e.g. @mychannel or -1001234567890
-GOOGLE_SHEET_ID     = os.environ["GOOGLE_SHEET_ID"]
-SHEET_TAB_NAME      = os.environ.get("SHEET_TAB_NAME", "Preferential & Warrants")
-GOOGLE_CREDS_JSON   = os.environ["GOOGLE_CREDS_JSON"]     # full JSON string of service account
+TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"].strip()
+TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"].strip()
+GOOGLE_SHEET_ID     = os.environ["GOOGLE_SHEET_ID"].strip()
+SHEET_TAB_NAME      = os.environ.get("SHEET_TAB_NAME", "Preferential & Warrants").strip()
+GOOGLE_CREDS_JSON   = os.environ["GOOGLE_CREDS_JSON"].strip()
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 
-# ── Seen IDs ─────────────────────────────────────────────────────────────────
-def load_seen_ids() -> set:
+def load_seen_ids():
     if os.path.exists(SEEN_IDS_FILE):
         with open(SEEN_IDS_FILE, "r") as f:
             return set(json.load(f))
     return set()
 
 
-def save_seen_ids(ids: set):
+def save_seen_ids(ids):
     with open(SEEN_IDS_FILE, "w") as f:
         json.dump(list(ids), f)
 
 
-# ── NSE Session ───────────────────────────────────────────────────────────────
-def get_nse_session() -> requests.Session:
-    """Create a session with NSE cookies (required to avoid 403)."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        session.get("https://www.nseindia.com", timeout=15)
-        time.sleep(2)
-    except Exception as e:
-        log.warning(f"Could not pre-fetch NSE home: {e}")
-    return session
+def escape_md(text):
+    for ch in ["_", "*", "[", "]", "`"]:
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
 
-# ── Fetch NSE Announcements ───────────────────────────────────────────────────
-def fetch_nse_announcements(session: requests.Session) -> list[dict]:
-    """Fetch corporate announcements from NSE API."""
-    params = {"index": "equities"}
-    try:
-        r = session.get(NSE_API_URL, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        if isinstance(data, list):
-            return data
-        # sometimes wrapped in a dict
-        return data.get("data", data.get("announcements", []))
-    except Exception as e:
-        log.error(f"NSE fetch error: {e}")
-        return []
-
-
-# ── Filter by keyword ─────────────────────────────────────────────────────────
-def is_relevant(announcement: dict) -> bool:
-    text_fields = [
-        announcement.get("subject", ""),
-        announcement.get("desc", ""),
-        announcement.get("anndesc", ""),
-        announcement.get("attchmntText", ""),
-    ]
-    combined = " ".join(str(f) for f in text_fields).lower()
-    return any(kw in combined for kw in KEYWORDS)
-
-
-# ── Within last 24 hours ──────────────────────────────────────────────────────
-def within_24h(announcement: dict) -> bool:
-    cutoff = datetime.utcnow() - timedelta(hours=24)
-    for key in ("date", "bfDate", "excDate", "an_dt"):
-        raw = announcement.get(key, "")
-        if not raw:
-            continue
-        for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
-            try:
-                dt = datetime.strptime(str(raw).strip(), fmt)
-                return dt >= cutoff
-            except ValueError:
-                pass
-    # If no date found, include it (safe default)
-    return True
-
-
-# ── Build row dict ────────────────────────────────────────────────────────────
-def build_row(ann: dict) -> dict:
-    symbol    = ann.get("symbol", "").strip()
-    company   = ann.get("desc", ann.get("sm_name", symbol)).strip()
-    subject   = ann.get("subject", "").strip()
-    anndesc   = ann.get("anndesc", "").strip()
-    category  = ann.get("categoryName", ann.get("category", "")).strip()
-    an_dt     = ann.get("an_dt", ann.get("date", "")).strip()
-    exc_date  = ann.get("excDate", "").strip()
-    attach    = ann.get("attchmntFile", "")
-
-    nse_link      = f"https://www.nseindia.com/api/announcements-attachments?filename={attach}" if attach else ""
-    screener_link = f"https://www.screener.in/company/{symbol}/announcements/" if symbol else ""
-
-    return {
-        "Logged at":          datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Company Name":       company,
-        "Symbol":             symbol,
-        "Category":           category,
-        "Title":              subject,
-        "Full Subject/Topic": anndesc or subject,
-        "NSE Dates":          an_dt,
-        "First Disclosure":   exc_date,
-        "NSE Link":           nse_link,
-        "Screener Link":      screener_link,
-    }
-
-
-# ── Google Sheets ─────────────────────────────────────────────────────────────
-def get_sheet():
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds  = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    client = gspread.authorize(creds)
-    sheet  = client.open_by_key(GOOGLE_SHEET_ID)
-
-    # Open or create the tab
-    try:
-        ws = sheet.worksheet(SHEET_TAB_NAME)
-    except gspread.WorksheetNotFound:
-        ws = sheet.add_worksheet(title=SHEET_TAB_NAME, rows=1000, cols=len(SHEET_COLUMNS))
-        ws.append_row(SHEET_COLUMNS)
-        log.info(f"Created new tab: {SHEET_TAB_NAME}")
-
-    # Ensure headers exist
-    existing = ws.row_values(1)
-    if existing != SHEET_COLUMNS:
-        ws.insert_row(SHEET_COLUMNS, 1)
-
-    return ws
-
-
-def append_to_sheet(ws, row_dict: dict):
-    row = [row_dict.get(col, "") for col in SHEET_COLUMNS]
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-
-# ── Telegram ──────────────────────────────────────────────────────────────────
-async def send_telegram(bot: Bot, channel: str, row: dict):
+def send_telegram(row):
     lines = [
-        f"📢 *NSE Announcement*",
-        f"🏢 *{row['Company Name']}* (`{row['Symbol']}`)",
-        f"🏷 Category: {row['Category']}",
-        f"📋 {row['Title']}",
+        "📢 *NSE Announcement*",
+        f"🏢 *{escape_md(row['Company Name'])}* (`{row['Symbol']}`)",
+        f"🏷 Category: {escape_md(row['Category'])}",
+        f"📋 {escape_md(row['Title'])}",
         f"📅 NSE Date: {row['NSE Dates']}",
         f"📅 First Disclosure: {row['First Disclosure']}",
     ]
@@ -206,37 +78,125 @@ async def send_telegram(bot: Bot, channel: str, row: dict):
         lines.append(f"🔍 [Screener]({row['Screener Link']})")
     lines.append(f"_Logged: {row['Logged at']}_")
 
-    msg = "\n".join(lines)
-    await bot.send_message(
-        chat_id=channel,
-        text=msg,
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
+    payload = {
+        "chat_id": TELEGRAM_CHANNEL_ID,
+        "text": "\n".join(lines),
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    resp = httpx.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=15)
+    if not resp.is_success:
+        log.error(f"Telegram error {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
+
+
+def get_nse_session():
+    session = requests.Session()
+    session.headers.update(NSE_HEADERS)
+    try:
+        session.get("https://www.nseindia.com", timeout=15)
+        time.sleep(2)
+    except Exception as e:
+        log.warning(f"NSE home prefetch failed: {e}")
+    return session
+
+
+def fetch_nse_announcements(session):
+    try:
+        r = session.get(NSE_API_URL, params={"index": "equities"}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list):
+            return data
+        return data.get("data", data.get("announcements", []))
+    except Exception as e:
+        log.error(f"NSE fetch error: {e}")
+        return []
+
+
+def is_relevant(ann):
+    combined = " ".join([
+        ann.get("subject", ""), ann.get("desc", ""),
+        ann.get("anndesc", ""), ann.get("attchmntText", ""),
+    ]).lower()
+    return any(kw in combined for kw in KEYWORDS)
+
+
+def within_24h(ann):
+    cutoff = datetime.utcnow() - timedelta(hours=24)
+    for key in ("date", "bfDate", "excDate", "an_dt"):
+        raw = ann.get(key, "")
+        if not raw:
+            continue
+        for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(str(raw).strip(), fmt) >= cutoff
+            except ValueError:
+                pass
+    return True
+
+
+def build_row(ann):
+    symbol   = ann.get("symbol", "").strip()
+    company  = ann.get("desc", ann.get("sm_name", symbol)).strip()
+    subject  = ann.get("subject", "").strip()
+    anndesc  = ann.get("anndesc", "").strip()
+    category = ann.get("categoryName", ann.get("category", "")).strip()
+    an_dt    = ann.get("an_dt", ann.get("date", "")).strip()
+    exc_date = ann.get("excDate", "").strip()
+    attach   = ann.get("attchmntFile", "")
+    nse_link = (f"https://www.nseindia.com/api/announcements-attachments?filename={attach}" if attach else "")
+    screener = f"https://www.screener.in/company/{symbol}/announcements/" if symbol else ""
+    return {
+        "Logged at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Company Name": company, "Symbol": symbol, "Category": category,
+        "Title": subject, "Full Subject/Topic": anndesc or subject,
+        "NSE Dates": an_dt, "First Disclosure": exc_date,
+        "NSE Link": nse_link, "Screener Link": screener,
+    }
+
+
+def get_sheet():
+    creds = Credentials.from_service_account_info(
+        json.loads(GOOGLE_CREDS_JSON),
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"]
     )
+    client = gspread.authorize(creds)
+    sheet  = client.open_by_key(GOOGLE_SHEET_ID)
+    try:
+        ws = sheet.worksheet(SHEET_TAB_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sheet.add_worksheet(title=SHEET_TAB_NAME, rows=1000, cols=len(SHEET_COLUMNS))
+        ws.append_row(SHEET_COLUMNS)
+        log.info(f"Created tab: {SHEET_TAB_NAME}")
+    if ws.row_values(1) != SHEET_COLUMNS:
+        ws.insert_row(SHEET_COLUMNS, 1)
+    return ws
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-async def main():
+def append_to_sheet(ws, row_dict):
+    ws.append_row([row_dict.get(c, "") for c in SHEET_COLUMNS], value_input_option="USER_ENTERED")
+
+
+def main():
     log.info("=== NSE Announcement Bot starting ===")
-
     seen_ids = load_seen_ids()
     session  = get_nse_session()
-    bot      = Bot(token=TELEGRAM_TOKEN)
 
     try:
         ws = get_sheet()
+        log.info("Google Sheet connected")
     except Exception as e:
-        log.error(f"Google Sheets connection failed: {e}")
+        log.error(f"Sheet connection failed: {e}")
         raise
 
     announcements = fetch_nse_announcements(session)
-    log.info(f"Fetched {len(announcements)} total announcements from NSE")
+    log.info(f"Fetched {len(announcements)} announcements from NSE")
 
     new_count = 0
     for ann in announcements:
-        # Build a unique ID from symbol + date + subject
         uid = f"{ann.get('symbol','')}_{ann.get('an_dt', ann.get('date',''))}_{ann.get('subject','')[:40]}"
-
         if uid in seen_ids:
             continue
         if not within_24h(ann):
@@ -245,28 +205,28 @@ async def main():
             continue
 
         row = build_row(ann)
-        log.info(f"New announcement: {row['Symbol']} — {row['Title'][:60]}")
+        log.info(f"New: {row['Symbol']} — {row['Title'][:60]}")
 
         try:
             append_to_sheet(ws, row)
-            log.info("  → Added to Google Sheet")
+            log.info("  → Sheet: OK")
         except Exception as e:
-            log.error(f"  Sheet write error: {e}")
+            log.error(f"  Sheet error: {e}")
             continue
 
         try:
-            await send_telegram(bot, TELEGRAM_CHANNEL_ID, row)
-            log.info("  → Sent to Telegram channel")
+            send_telegram(row)
+            log.info("  → Telegram: OK")
         except Exception as e:
-            log.error(f"  Telegram send error: {e}")
+            log.error(f"  Telegram error: {e}")
 
         seen_ids.add(uid)
         new_count += 1
-        time.sleep(1)   # polite delay between Telegram messages
+        time.sleep(1)
 
     save_seen_ids(seen_ids)
     log.info(f"=== Done. {new_count} new announcements processed. ===")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
