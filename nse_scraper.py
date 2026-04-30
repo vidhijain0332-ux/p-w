@@ -40,7 +40,7 @@ TELEGRAM_TOKEN      = os.environ["TELEGRAM_TOKEN"].strip()
 TELEGRAM_CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"].strip()
 GOOGLE_SHEET_ID     = os.environ["GOOGLE_SHEET_ID"].strip()
 SHEET_TAB_NAME      = os.environ.get("SHEET_TAB_NAME", "Preferential & Warrants").strip()
-GOOGLE_CREDS_JSON   = os.environ["GOOGLE_CREDS_JSON"].strip()
+GOOGLE_CREDS_PATH   = os.environ["GOOGLE_CREDS_PATH"].strip()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
@@ -157,8 +157,10 @@ def build_row(ann):
 
 
 def get_sheet():
+    with open(GOOGLE_CREDS_PATH, "r") as f:
+        creds_dict = json.load(f)
     creds = Credentials.from_service_account_info(
-        json.loads(GOOGLE_CREDS_JSON),
+        creds_dict,
         scopes=["https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive"]
     )
